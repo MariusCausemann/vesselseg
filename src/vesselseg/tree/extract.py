@@ -110,6 +110,11 @@ pieces (after Tuertken et al., TPAMI 2016).
    capacity program harder (sub-01: 4.1% gap after 600 s with --w_leaf 1
    --bridge_detour 5, and the left carotid siphon cut short, against 2.0%
    without; these numbers are from the earlier fixed-rule radius and full MIP).
+   Loops: because two arcs may end at one node, a tree can come back to a node
+   its own path from the inlet already left -- a loop, closed wherever the
+   selection found it cheapest, which decides the direction of the blood
+   around it. Their point pairs are written (field data loop_returns), and
+   label.py re-cuts the ones inside one territory by blood pressure.
 4. Joins: the result is one tree per inlet (which inlet feeds what). They are
    joined into one piece where they meet at a node (thickest node first),
    else by the cheapest path of unused segments (bridge candidates included)
@@ -1024,6 +1029,27 @@ def select_tree(segs, n_nodes, r_node, inlets, args, node_xyz, h=None):
     return A, parent, info
 
 
+def loop_returns(A, parent):
+    """The arcs that end at a node their own path from the inlet started from.
+
+    Two arcs may end at one node (a contact or a crossing), so a tree can leave
+    a node and come back to it further down: a loop, closed wherever the
+    selection found it cheapest, which decides the direction around it (sub-01
+    --ridge_reach 2.5: ~100 mm of distal ACA fed the long way round). Returns
+    ``[(b, a)]``: ``b`` the returning arc, ``a`` its ancestor that starts at
+    ``b``'s end node. The tree is written as selected; label.py re-cuts the
+    loops inside one territory by blood pressure."""
+    out = []
+    for b in sorted(parent):
+        v, a = A[b][3], parent[b]
+        while a != -1:
+            if A[a][2] == v:
+                out.append((b, a))
+                break
+            a = parent[a]
+    return out
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1714,6 +1740,7 @@ def main(argv=None):
         cell_tree.append(tree)
 
     start_pt = {}
+    arc_pt = {}  # arc -> (point id of its start, of its end)
     for b in used:
         if parent[b] == -1:
             n = A[b][2]
@@ -1729,7 +1756,7 @@ def main(argv=None):
         chain = [b]
         while len(children.get(chain[-1], [])) == 1 and A[chain[-1]][3] not in breaks:
             chain.append(children[chain[-1]][0])
-        xyz, rr, pp = [], [], []
+        xyz, rr, pp, ends_at = [], [], [], []
         for a in chain:
             k, fwd = A[a][0], A[a][1]
             sg = segs[k]
@@ -1740,6 +1767,7 @@ def main(argv=None):
                 pts_[-1] += offset(A[a][3])
             xyz.append(pts_)
             rr.append(r_[1:])
+            ends_at.append(sum(len(x_) for x_ in xyz))  # index in allp of its end
         xyz = np.vstack(xyz)
         rr = np.concatenate(rr)
         p0 = start_pt[b]
@@ -1751,18 +1779,24 @@ def main(argv=None):
         n_end = A[chain[-1]][3]
         kids = children.get(chain[-1], [])
         ids = [p0]
+        pid = [p0]  # point id per allp index (a dropped repeat: the previous one)
         # windows of neighbouring points can coincide: drop repeated points
         dup = np.r_[False, np.linalg.norm(np.diff(sm, axis=0), axis=1) < 1e-6]
         for x_, r_, p_, d_ in zip(sm[1:-1], r_all[1:-1], p_all[1:-1], dup[1:-1]):
             if d_:
+                pid.append(pid[-1])
                 continue
             pts_out.append(x_)
             rad_out.append(r_)
             p_out.append(p_)
             node_type.append(0)
             ids.append(len(pts_out) - 1)
+            pid.append(ids[-1])
         t_end = 0 if kids else 1
         ids.append(new_point(n_end, node_pos[n_end], r_all[-1], t_end, tr, p_all[-1]))
+        pid.append(ids[-1])
+        for i, a in enumerate(chain):
+            arc_pt[a] = (pid[ends_at[i - 1]] if i else p0, pid[ends_at[i]])
         for c_ in kids:
             start_pt[c_] = ids[-1]
             stack.append(c_)
@@ -1832,6 +1866,10 @@ def main(argv=None):
     p_out = np.asarray(p_out)[keep]
     node_type = np.asarray(node_type)[keep]
 
+    returns = [  # (returning point, upstream copy of the same node), final ids
+        (new_id[resolve(arc_pt[b][1])], new_id[resolve(arc_pt[a][0])])
+        for b, a in loop_returns(A, parent)
+    ]
     net = pv.PolyData(pts_out, lines=np.concatenate([np.r_[len(i), i] for i in lines]))
     net["radius"] = np.array(rad_out)
     net["evidence"] = np.asarray(p_out, np.float32)
@@ -1842,6 +1880,7 @@ def main(argv=None):
     net.cell_data["origin"] = np.array(origin)
     net.cell_data["inlet"] = np.array(cell_tree)
     net.field_data["inlet_names"] = np.array(trees)
+    net.field_data["loop_returns"] = np.array(returns, np.int64).reshape(-1, 2)
     net.save(outdir / f"{name}.vtp")
     tubes = []
     for b, ids in enumerate(lines):
@@ -1868,6 +1907,7 @@ def main(argv=None):
         skeleton_length_used_mm=round(float(used_len), 1),
         skeleton_segments_dropped=int(n_skel - sum(k < n_skel for k in seg_used)),
         shared_nodes=len(shared),
+        loop_returns=len(returns),
         trees={
             trees[t]: round(float(np.sum(np.array(cell_len)[np.array(cell_tree) == t])), 1)
             for t in range(len(trees))

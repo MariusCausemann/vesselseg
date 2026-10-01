@@ -42,7 +42,13 @@ have loops and no inlets, and are no longer supported.
 
 Output (next to DIR/NAME):
   NAME_labeled.vtp        NAME.vtp + cell/point data `segment` (index into the
-                          field data `segment_names`)
+                          field data `segment_names`) and point data
+                          `blood_pressure` (Poiseuille, fitted radius: 1 at the
+                          inlets, 0 at every other tip; blood.py), the blood
+                          direction for a consumer such as proteoflow. Loops
+                          inside one territory (extract.py's loop_returns) are
+                          re-cut where their blood flows meet (recut_loops), so
+                          its polylines can differ from NAME.vtp's
   NAME_tubes_labeled.vtp  NAME_tubes.vtp + cell data `segment`
   NAME_labeled.json       inlets, termini, CoW pieces, per-label length,
                           implausible junctions
@@ -64,8 +70,10 @@ import nibabel as nib
 import numpy as np
 import pyvista as pv
 from scipy import ndimage
+from scipy.spatial import cKDTree
 
 from vesselseg.io import midplane, polylines
+from vesselseg.tree.blood import network_pressure
 
 NAMES = [
     "unknown",
@@ -299,6 +307,146 @@ def label_tree(tree, U, TR, root, TRv):
     return lab, into, kids, parent
 
 
+def point_edges(polys):
+    """``(edges (m, 2), cell (m,))``: consecutive points of each polyline."""
+    edges = np.vstack([np.c_[ids[:-1], ids[1:]] for ids in polys])
+    cell = np.repeat(np.arange(len(polys)), [len(ids) - 1 for ids in polys])
+    return edges, cell
+
+
+def inlet_points(points, edges, xyz):
+    """The tip (degree-1 point) nearest each inlet coordinate."""
+    deg = np.bincount(edges.ravel(), minlength=len(points))
+    tips = np.flatnonzero(deg == 1)
+    return tips[cKDTree(points[tips]).query(np.asarray(xyz))[1]]
+
+
+def recut_loops(net, seg, inlet_xyz):
+    """Re-cut the loops of one territory where their blood flows meet.
+
+    extract.py writes, as field data ``loop_returns``, the point pairs where
+    its tree comes back to a node its own path from the inlet left (a copy of
+    the node, offset by 0.03 mm). Each pair whose loop (the tree path between
+    the two copies) lies inside one territory label (ACA, MCA-L/R, PCA-L/R,
+    cerebellar) is joined; the Poiseuille pressure (blood.py, fitted radius,
+    p = 1 at the inlets, 0 at the other tips) is solved, and the loop is cut
+    again at its point of lowest pressure, detaching the loop edge there that
+    carries less blood (it ends at a new copy of the point). So the vessels
+    around the loop run the way the blood does, not the way the selection
+    happened to close it. Loops touching a trunk or the CoW are left alone:
+    there a return is as often a contact between two vessels (sub-01: the
+    basilar against a thinner artery, whose re-cut moved the basilar tip).
+    Labels are unchanged, every new polyline is a piece of an old one.
+
+    Returns ``(net, seg, report)``, ``net`` a new PolyData (polylines between
+    junctions, tips and the old polyline ends, pointing down the pressure; cell
+    data copied from the old polyline, ``branch``/``length``/``mean_radius``
+    recomputed) and ``seg`` its labels; ``net`` is the input when nothing
+    changes. ``report`` lists the loops re-cut and skipped."""
+    pairs = np.asarray(net.field_data.get("loop_returns", np.zeros((0, 2))), np.int64)
+    report = dict(recut=[], skipped=0)
+    if not len(pairs):
+        return net, seg, report
+    P = np.asarray(net.points, dtype=np.float64)
+    R = np.asarray(net.point_data["radius"], dtype=np.float64)
+    polys = polylines(net)
+    E, cell = point_edges(polys)
+    ends = {int(i) for ids in polys for i in (ids[0], ids[-1])}
+    inlets = inlet_points(P, E, inlet_xyz)
+    territory = set(TERRITORY) - {UNK}
+    src = list(range(len(P)))  # point -> the point whose data it copies
+    pos = [P]
+    changed = False
+    for pr, pu in pairs.tolist():
+        G = nx.Graph()
+        G.add_edges_from((int(a), int(b), {"e": k}) for k, (a, b) in enumerate(E))
+        if pr not in G or pu not in G or pr == pu:
+            continue
+        path = nx.shortest_path(G, pu, pr)
+        loop_e = [G.edges[a, b]["e"] for a, b in pairwise(path)]
+        labels = {int(seg[cell[k]]) for k in loop_e}
+        if len(path) < 3 or len(labels) != 1 or not labels <= territory:
+            report["skipped"] += 1
+            continue
+        E[E == pr] = pu  # join the return to its node
+        pts = np.vstack(pos)
+        p, Gc = network_pressure(pts, E, R[src], inlets)
+        cyc = path[:-1]  # pu ... (pr joined into pu)
+        i = int(np.argmin(p[cyc]))
+        m = cyc[i]
+        e_in, e_out = loop_e[i - 1], loop_e[i]  # the loop edges at m (pu: last, first)
+        flow = lambda k: Gc[k] * abs(p[E[k, 0]] - p[E[k, 1]])
+        k = min((e_in, e_out), key=flow)
+        new = len(src)
+        src.append(src[m])
+        pos.append(pts[m] + 0.03)
+        E[k][E[k] == m] = new
+        ends |= {m, new}
+        changed = True
+        report["recut"].append(
+            dict(
+                label=NAMES[labels.pop()],
+                loop_mm=round(float(np.linalg.norm(np.diff(P[path], axis=0), axis=1).sum()), 1),
+                closed_xyz=P[pu].round(1).tolist(),
+                cut_xyz=pts[m].round(1).tolist(),
+            )
+        )
+    if not changed:
+        return net, seg, report
+
+    # polylines of the new graph, each oriented down the pressure
+    pts = np.vstack(pos)
+    p, _ = network_pressure(pts, E, R[src], inlets)
+    G = nx.Graph()
+    G.add_edges_from((int(a), int(b), {"e": k}) for k, (a, b) in enumerate(E))
+    special = {n for n in ends if n in G} | {n for n in G if G.degree(n) != 2}
+    chains, seen = [], set()
+    for s0 in sorted(special):
+        for nb in G.neighbors(s0):
+            k = G.edges[s0, nb]["e"]
+            if k in seen:
+                continue
+            ids, es = [s0, nb], [k]
+            seen.add(k)
+            while ids[-1] not in special:
+                nxt = next(m for m in G.neighbors(ids[-1]) if m != ids[-2])
+                es.append(G.edges[ids[-1], nxt]["e"])
+                seen.add(es[-1])
+                ids.append(nxt)
+            if p[ids[-1]] > p[ids[0]]:
+                ids = ids[::-1]
+            chains.append((ids, int(cell[es[0]])))
+    used = np.unique(np.concatenate([ids for ids, _ in chains]))
+    new_id = np.full(len(pts), -1)
+    new_id[used] = np.arange(len(used))
+    lines = [new_id[ids] for ids, _ in chains]
+    out = pv.PolyData(pts[used], lines=np.concatenate([np.r_[len(i), i] for i in lines]))
+    srcs = np.asarray(src)[used]
+    for k in net.point_data:
+        out.point_data[k] = np.asarray(net.point_data[k])[srcs]
+    old = np.array([c for _, c in chains])
+    for k in net.cell_data:
+        out.cell_data[k] = np.asarray(net.cell_data[k])[old]
+    out.cell_data["branch"] = np.arange(len(lines))
+    out.cell_data["length"] = np.array(
+        [np.linalg.norm(np.diff(out.points[i], axis=0), axis=1).sum() for i in lines]
+    )
+    out.cell_data["mean_radius"] = np.array([out["radius"][i].mean() for i in lines])
+    for k in net.field_data:
+        if k != "loop_returns":
+            out.field_data[k] = net.field_data[k]
+    return out, np.asarray(seg)[old], report
+
+
+def blood_pressure(net, inlet_xyz):
+    """Poiseuille blood pressure per point of the tree (:mod:`vesselseg.tree.blood`,
+    fitted radius): 1 at the tips nearest the inlets, 0 at every other tip."""
+    P = np.asarray(net.points)
+    E, _ = point_edges(polylines(net))
+    p, _ = network_pressure(P, E, net.point_data["radius"], inlet_points(P, E, inlet_xyz))
+    return p
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="vesselseg label", description=__doc__.split("\n")[0])
     p.add_argument("tree", help="path stem DIR/NAME of the `vesselseg extract` output")
@@ -460,18 +608,29 @@ def main(argv=None):
                     )
                 )
 
+    # loops inside one territory, re-cut by blood pressure
+    inlet_xyz = tree.X[inlets]
+    out, seg_out, loops = recut_loops(net, seg, inlet_xyz)
+    print(
+        f"loops: {len(loops['recut'])} re-cut inside a territory, "
+        f"{loops['skipped']} left (trunk/CoW or several labels)",
+        flush=True,
+    )
+
     # outputs
-    out = net.copy()
-    out.cell_data["segment"] = seg
+    out = out.copy()
+    out.cell_data["segment"] = seg_out
+    out.point_data["blood_pressure"] = blood_pressure(out, inlet_xyz)
     seg_pt = np.zeros(out.n_points, np.int8)
-    for c, ids in enumerate(tree.polys):
-        seg_pt[ids] = seg[c]
+    for c, ids in enumerate(polylines(out)):
+        seg_pt[ids] = seg_out[c]
     out.point_data["segment"] = seg_pt
     out.field_data["segment_names"] = np.array(NAMES)
     out.save(outdir / f"{stem}_labeled.vtp")
     tubes_path = outdir / f"{stem}_tubes.vtp"
     if tubes_path.exists():
         tubes = pv.read(tubes_path)
+        # the tubes keep the branches of NAME.vtp (a re-cut loop only splits one)
         tubes.cell_data["segment"] = seg[np.asarray(tubes.cell_data["branch"])]
         tubes.field_data["segment_names"] = np.array(NAMES)
         tubes.save(outdir / f"{stem}_tubes_labeled.vtp")
@@ -493,6 +652,7 @@ def main(argv=None):
             for k in range(K)
         },
         implausible_junctions=switches,
+        loops=loops,
     )
     (outdir / f"{stem}_labeled.json").write_text(json.dumps(stats, indent=2))
     print(json.dumps({k: stats[k] for k in ("landmarks", "cow_pieces", "segments")}, indent=2))
