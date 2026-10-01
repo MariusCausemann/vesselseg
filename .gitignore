@@ -8,7 +8,7 @@ scratch_milp/
 *.sif
 *.nii
 *.nii.gz
-/tip.png
+pixi.lock
 
 # third-party checkouts and builds
 external/
