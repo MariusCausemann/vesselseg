@@ -20,6 +20,7 @@ dependencies = [
     "highspy",
     "antspyx",
     "agd",
+    "HFMpy",
     "pyyaml",
     # risc-mi MS runs in brainseg's container (brainseg riscmi_arteries)
     "brainseg-containers>=1.2",
@@ -53,10 +54,6 @@ highspy = "*"
 antspyx = "*"
 pyyaml = "*"
 apptainer = "*"
-# HamiltonFastMarching build (vesselseg build-hfm)
-cmake = "*"
-cxx-compiler = "*"
-make = "*"
 pytest = "*"
 ruff = "*"
 
@@ -64,9 +61,9 @@ ruff = "*"
 vesselseg = { path = ".", editable = true }
 brainseg-containers = { path = "../brainseg", editable = true }
 agd = "*"
+HFMpy = "*"
 
 [tool.pixi.tasks]
-build-hfm = "vesselseg build-hfm"
 test = "pytest"
 lint = "ruff check src tests && ruff format --check src tests"
 

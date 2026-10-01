@@ -20,7 +20,6 @@ COMMANDS = {
         "territory labels (ICA, VB, CoW, ACA, MCA, PCA, ...)",
     ),
     "run": ("vesselseg.pipeline", "all steps from a YAML config"),
-    "build-hfm": ("vesselseg.hfm", "build the HamiltonFastMarching executable"),
     "doctor": ("vesselseg.cli", "check that everything needed offline is present"),
 }
 
@@ -38,11 +37,9 @@ def doctor(argv=None):
     """Report what the pipeline needs and whether this machine has it; exit 1 if not."""
     import argparse
     import shutil
-    import subprocess
 
     p = argparse.ArgumentParser(prog="vesselseg doctor", description=doctor.__doc__)
     p.add_argument("--container", help="brainseg_riscmi.sif to check instead of the lookup")
-    p.add_argument("--hfm_bin", help="HFM directory to check instead of the lookup")
     p.add_argument("--no_segment", action="store_true", help="skip the container checks")
     args = p.parse_args(argv)
     ok = True
@@ -67,15 +64,11 @@ def doctor(argv=None):
         except ImportError as e:
             report(f"python {mod}", False, str(e))
 
-    from vesselseg.hfm import EXE, find_hfm
-
     try:
-        d = find_hfm(args.hfm_bin)
-        # the executable prints a usage line and exits without an input file
-        subprocess.run([str(d / EXE)], capture_output=True, timeout=30)
-        report("HFM", True, str(d / EXE))
-    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
-        report("HFM", False, str(e))
+        hfmpy = importlib.import_module("HFMpy.HFM_ReedsSheppForward3")
+        report("HFM", True, hfmpy.__file__)
+    except ImportError as e:
+        report("HFM", False, f"{e} (pip install HFMpy)")
 
     if not args.no_segment:
         runtime = shutil.which("apptainer") or shutil.which("singularity")

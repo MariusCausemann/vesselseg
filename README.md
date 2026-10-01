@@ -35,12 +35,11 @@ post-intrathecal-Gd T1w sessions). proteoflow uses the tree for its perivascular
 ## Install
 
 vesselseg is a pure Python package (`src/vesselseg`) with one console script,
-`vesselseg`. Two pieces live outside Python:
+`vesselseg`. One piece lives outside Python:
 
 | piece | what | how it is found |
 |---|---|---|
 | risc-mi MS | nnU-Net model + weights, PyTorch | brainseg's `brainseg_riscmi.sif` (Apptainer) |
-| HamiltonFastMarching | compiled `FileHFM_ReedsSheppForward3` | `vesselseg build-hfm`, or `$VESSELSEG_HFM_BIN` |
 
 **Inside proteoflow** (the normal case): proteoflow's `pyproject.toml` lists
 vesselseg, brainseg and brainmesh as path dependencies of its pixi env. They
@@ -48,14 +47,13 @@ must be checked out next to it:
 
 ```bash
 cd proteoflow && pixi install
-pixi run vesselseg build-hfm      # once; builds into proteoflow/.vesselseg/hfm/
 pixi run vesselseg doctor         # what is present, what is missing
 ```
 
 **Standalone**: `pixi install` in this repo gives the same env (the
 `[tool.pixi]` tables of `pyproject.toml`; brainseg from `../brainseg`). Or use
-`pip install -e . -e ../brainseg` in any Python >= 3.11 env with cmake and a
-C++17 compiler for the HFM build.
+`pip install -e . -e ../brainseg` in any Python >= 3.11 env. HamiltonFastMarching
+comes from the `HFMpy` wheel (manylinux, no compiler needed).
 
 **The risc-mi container** comes from brainseg (`dockerfiles/Dockerfile.riscmi`).
 It is private because the weights are proprietary (see below), so log in first:
@@ -332,16 +330,10 @@ over from a connected machine:
        pip install --no-deps --no-build-isolation -e "$r"
    done
    ```
-3. **HamiltonFastMarching**: either copy the built `.vesselseg/hfm/build/` and
-   set `VESSELSEG_HFM_BIN` to it, or copy the sources and build there. The env
-   includes cmake and a C++ compiler.
-   ```bash
-   vesselseg build-hfm --src HamiltonFastMarching.tar.gz
-   ```
-   `build-hfm` keeps a copy of the sources it used in `.vesselseg/hfm/src/`, which
-   can be archived for this. In Snakemake, set `vessels.hfm_src` instead.
+3. **HamiltonFastMarching**: the `HFMpy` wheel is part of the pixi-pack'd env, nothing
+   to build or copy.
 
-Then `vesselseg doctor` checks everything: the Python modules, that HFM runs,
+Then `vesselseg doctor` checks everything: the Python modules, that HFMpy imports,
 the container runtime, and that the `.sif` is found.
 
 ## Resources and runtime

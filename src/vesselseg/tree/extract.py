@@ -32,7 +32,7 @@ pieces (after Tuertken et al., TPAMI 2016).
    vessels touching or crossing leave) are merged into one node, so a crossing
    becomes one node where the vessels can pass straight through.
 2. Candidate bridges: from every free end, curvature-penalised minimal paths
-   (Reeds-Shepp forward model, HamiltonFastMarching via agd) in a box of
+   (Reeds-Shepp forward model, HamiltonFastMarching via agd and the HFMpy wheel) in a box of
    --max_gap mm, resampled to an isotropic grid of --hfm_step mm (the
    orientation sphere needs one grid scale), seeded with the end's outgoing
    direction, through the metric 1 + max(0, -w(P)). The --bridges cheapest
@@ -153,8 +153,7 @@ P = 0.0136, and only 33 mm of the 8.5 m skeleton has a mean P < 0.02 (251 mm
 < 0.05), so p0 acts on the bridge metric (P < p0 costs up to 3x) rather than
 on which segments are kept.
 
-usage: vesselseg build-hfm   (once)
-       vesselseg extract --evidence EVID --sasparc SASPARC -o tree/centerlines
+usage: vesselseg extract --evidence EVID --sasparc SASPARC -o tree/centerlines
        vesselseg fit-radius tree/centerlines
        vesselseg label tree/centerlines --sasparc SASPARC
 """
@@ -164,7 +163,6 @@ import json
 import multiprocessing
 import os
 import pickle
-import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from itertools import pairwise
@@ -180,7 +178,6 @@ from scipy.spatial import cKDTree
 from skimage.filters import apply_hysteresis_threshold
 from skimage.morphology import skeletonize
 
-from vesselseg.hfm import find_hfm
 from vesselseg.io import midplane
 from vesselseg.tree.radius_model import growth_cost, rel_var, validity
 
@@ -324,19 +321,11 @@ def merge_close_junctions(node_pos, node_r, node_size, segments, sp, min_len):
 # 2. candidate bridges (curvature-penalised minimal paths)
 
 
-def _hfm_setup(workdir):
-    from agd.Eikonal import FileIO, LibraryCall
+def _hfm_setup():
+    from agd.Eikonal import LibraryCall
 
-    LibraryCall.binary_dir["FileHFM"] = str(find_hfm())
-    if not getattr(FileIO, "_private_dir", False):
-        orig = FileIO.WriteCallRead
-
-        def wcr(inp, exe, binary_dir="", **kw):
-            kw["working_dir"] = workdir
-            return orig(inp, exe, binary_dir, **kw)
-
-        FileIO.WriteCallRead = wcr
-        FileIO._private_dir = True
+    # None selects the HFMpy library (pip install HFMpy) over a FileHFM executable
+    LibraryCall.binary_dir["FileHFM"] = None
 
 
 def _hfm_box(cost, g, n_theta, xi):
@@ -371,8 +360,8 @@ def bridge_job(job):
     in the frame physical = voxel * sp (a rigid image of the scanner frame, so
     directions and angles are preserved). Returns geodesics in voxel coords.
     """
-    (e, x_e, d_e, cost, lo, targets, sp, g, n_theta, xi, n_keep, workdir) = job
-    _hfm_setup(workdir)
+    (e, x_e, d_e, cost, lo, targets, sp, g, n_theta, xi, n_keep) = job
+    _hfm_setup()
     n = np.floor((np.array(cost.shape) - 1) * sp / g).astype(int) + 1
     grid = np.meshgrid(*[np.arange(k) * g / s_ for k, s_ in zip(n, sp)], indexing="ij")
     cost = ndimage.map_coordinates(cost, grid, order=1, mode="nearest")
@@ -1260,12 +1249,6 @@ def parser():
         required=True,
         help="output path stem DIR/NAME (writes DIR/NAME.vtp, DIR/NAME.json, ...)",
     )
-    p.add_argument(
-        "--hfm_bin",
-        default=None,
-        help="directory of the FileHFM_ReedsSheppForward3 binary "
-        "(default: $VESSELSEG_HFM_BIN, then the `vesselseg build-hfm` location)",
-    )
     p.add_argument("--t2_only", action="store_true", help="P = T2w alone")
     p.add_argument("--grow", type=float, default=0.01, help="P, candidate hysteresis")
     p.add_argument("--seed", type=float, default=0.5, help="P, candidate seeds")
@@ -1349,8 +1332,6 @@ def main(argv=None):
     args = parser().parse_args(argv)
     outdir, name = Path(args.out).parent, Path(args.out).name
     outdir.mkdir(parents=True, exist_ok=True)
-    # resolved once here; the bridge workers inherit it through the environment
-    os.environ["VESSELSEG_HFM_BIN"] = str(find_hfm(args.hfm_bin))
     stats = dict(args=vars(args))
     timings = stats["timings_s"] = {}
 
@@ -1417,7 +1398,6 @@ def main(argv=None):
             seg_at.setdefault(u, []).append(k)
             seg_at.setdefault(v, []).append(k)
 
-        work = tempfile.mkdtemp(prefix="hfm_")
         jobs = []
         half = np.ceil(args.max_gap / sp).astype(int) + 2
         wcost = 1 + np.maximum(0, -weight(P, args.p0))
@@ -1466,7 +1446,7 @@ def main(argv=None):
             box = wcost[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]].astype(float)
             jobs.append(
                 (e, x_e, d, box, lo, targets, sp, args.hfm_step)
-                + (args.n_theta, args.xi, args.bridges, None)
+                + (args.n_theta, args.xi, args.bridges)
             )
         print(
             f"bridge candidates: {len(jobs)} free ends with targets of {len(free)}",
@@ -1474,11 +1454,7 @@ def main(argv=None):
         )
         results = []
         with ProcessPoolExecutor(args.workers) as ex:
-            futs = []
-            for i, j in enumerate(jobs):
-                wd = os.path.join(work, str(i))
-                os.makedirs(wd)
-                futs.append(ex.submit(bridge_job, (*j[:-1], wd)))
+            futs = [ex.submit(bridge_job, j) for j in jobs]
             for f in futs:
                 results.append(f.result())
         tick("minimal_paths", t0)
