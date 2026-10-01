@@ -1,0 +1,26 @@
+# data, results and model weights (never committed)
+data/
+results/
+weights/
+logs/
+outputs/
+scratch_milp/
+*.sif
+*.nii
+*.nii.gz
+/tip.png
+
+# third-party checkouts and builds
+external/
+.vesselseg/
+
+# environments and caches
+.pixi/*
+!.pixi/config.toml
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/

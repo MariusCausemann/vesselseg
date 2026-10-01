@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vesselseg"
+version = "0.1.0"
+description = "Cerebral artery trees from non-angiographic structural MRI (risc-mi MS + global tree selection)"
+authors = [{ name = "Marius Causemann", email = "mariusca@simula.no" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "nibabel",
+    "scikit-image",
+    "simpleitk",
+    "pyvista",
+    "networkx",
+    "highspy",
+    "antspyx",
+    "agd",
+    "pyyaml",
+    # risc-mi MS runs in brainseg's container (brainseg riscmi_arteries)
+    "brainseg-containers>=1.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+vesselseg = "vesselseg.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# --- Pixi (development env; proteoflow installs vesselseg into its own env) ---
+[tool.pixi.workspace]
+name = "vesselseg"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.12.*"
+numpy = "*"
+scipy = "*"
+nibabel = "*"
+scikit-image = "*"
+simpleitk = "*"
+pyvista = "*"
+networkx = "*"
+highspy = "*"
+antspyx = "*"
+pyyaml = "*"
+apptainer = "*"
+# HamiltonFastMarching build (vesselseg build-hfm)
+cmake = "*"
+cxx-compiler = "*"
+make = "*"
+pytest = "*"
+ruff = "*"
+
+[tool.pixi.pypi-dependencies]
+vesselseg = { path = ".", editable = true }
+brainseg-containers = { path = "../brainseg", editable = true }
+agd = "*"
+
+[tool.pixi.tasks]
+build-hfm = "vesselseg build-hfm"
+test = "pytest"
+lint = "ruff check src tests && ruff format --check src tests"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 100
+extend-exclude = ["experiments", "external", "scratch_milp"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I001"]
+ignore = ["E731"]  # short lambdas are the house style
+
+[tool.ruff.lint.isort]
+known-first-party = ["vesselseg"]

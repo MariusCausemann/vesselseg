@@ -1,0 +1,118 @@
+[workspace]
+name = "vesselseg"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[system-requirements]
+cuda = "12"
+
+# prep / evaluation (default env)
+[dependencies]
+python = "3.11.*"
+nibabel = "*"
+scikit-image = "*"
+scipy = "*"
+matplotlib = "*"
+pandas = "*"
+pyvista = "*"
+simpleitk = "*"
+ruff = "*"
+networkx = "*"
+highspy = "*"
+cmake = "*"
+cxx-compiler = "*"
+make = "*"
+
+[pypi-dependencies]
+antspyx = "*"
+# curvature-penalised minimal paths (extract_tree.py); its CPU solver is the
+# FileHFM executables that `pixi run build-hfm` compiles into external/
+agd = "*"
+
+[tasks.build-hfm]
+cmd = """
+test -d external/HamiltonFastMarching || git clone --depth 1 https://github.com/Mirebeau/HamiltonFastMarching.git external/HamiltonFastMarching
+&& cmake -S external/HamiltonFastMarching/Interfaces/FileHFM -B external/HamiltonFastMarching/build -DCMAKE_BUILD_TYPE=Release -DIncludeStandardModels=OFF -DIncludeExperimentalModels=OFF -DCustomModelNames=ReedsSheppForward3
+&& cmake --build external/HamiltonFastMarching/build -j 8
+"""
+
+# vesselFM: imported from external/vesselFM via PYTHONPATH rather than
+# `pip install -e`, whose requirements.txt pins training-only deps
+# (wandb, pylibtiff, tensorboard) that are not needed for inference.
+[feature.vesselfm.dependencies]
+python = "3.10.*"
+
+[feature.vesselfm.pypi-dependencies]
+torch = { version = "==2.5.1", index = "https://download.pytorch.org/whl/cu121" }
+monai = "==1.3.2"
+hydra-core = "==1.3.2"
+huggingface_hub = "==0.29.1"
+numpy = "==1.26.4"
+scikit-image = "==0.24.0"
+SimpleITK = "==2.4.0"
+tqdm = "*"
+nibabel = "*"
+
+[feature.vesselfm.activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT/external/vesselFM"
+
+[feature.nnunet.dependencies]
+python = "3.11.*"
+
+[feature.nnunet.pypi-dependencies]
+torch = { version = "==2.5.1", index = "https://download.pytorch.org/whl/cu121" }
+nnunetv2 = "*"
+SimpleITK = "*"
+nibabel = "*"
+gdown = "*"
+antspyx = "*"
+pooch = "*"
+requests = "*"
+
+[feature.nnunet.activation.env]
+nnUNet_results = "$PIXI_PROJECT_ROOT/weights/nnunet_results"
+nnUNet_raw = "$PIXI_PROJECT_ROOT/weights/nnunet_raw"
+nnUNet_preprocessed = "$PIXI_PROJECT_ROOT/weights/nnunet_preprocessed"
+PYTHONPATH = "$PIXI_PROJECT_ROOT/external/anat2vessels/src"
+
+# VMTK centerlines (pins vtk 9.2.6 + numpy<2, so it gets its own env)
+[feature.vmtk.dependencies]
+python = "3.11.*"
+vmtk = "1.5.*"
+numpy = "<2"
+pyvista = "0.43.*"
+nibabel = "*"
+scipy = "*"
+scikit-image = "*"
+networkx = "*"
+
+# TubeTK ridge-traversal centerlines (itk 5.4 wheels, separate from vmtk's vtk pin)
+[feature.tubetk.dependencies]
+python = "3.11.*"
+nibabel = "*"
+scipy = "*"
+scikit-image = "*"
+networkx = "*"
+pyvista = "*"
+
+[feature.tubetk.pypi-dependencies]
+itk-tubetk = "==1.4.1"
+
+# SeqSeg sequential tracing (github.com/numisveinsson/SeqSeg); used in its
+# SEGMENTATION mode on network.nii.gz, so no nnU-Net weights are needed
+[feature.seqseg.dependencies]
+python = "3.11.*"
+nibabel = "*"
+pyvista = "*"
+networkx = "*"
+
+[feature.seqseg.pypi-dependencies]
+torch = { version = "==2.5.1", index = "https://download.pytorch.org/whl/cu121" }
+seqseg = "==2.1.6"
+
+[environments]
+vesselfm = { features = ["vesselfm"], no-default-feature = true }
+nnunet = { features = ["nnunet"], no-default-feature = true }
+vmtk = { features = ["vmtk"], no-default-feature = true }
+tubetk = { features = ["tubetk"], no-default-feature = true }
+seqseg = { features = ["seqseg"], no-default-feature = true }
