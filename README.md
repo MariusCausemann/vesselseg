@@ -167,7 +167,11 @@ averaged first), and $P=0$ outside the brain+CSF segmentation dilated by 20 mm.
   6 mm box. They use the Reeds-Shepp forward model of HamiltonFastMarching on an
   isotropic 0.5 mm grid, seeded with the end's direction, through the metric
   $1+\max(0,-w(P))$. The two cheapest real shortcuts per end become extra
-  candidates.
+  candidates. A free end of a skeleton piece that holds no inlet also searches
+  15 mm (`--max_gap_far`), to the other pieces only, and keeps its four cheapest
+  paths. Otherwise a piece behind a gap longer than 6 mm is dropped, or is
+  hooked onto whatever happens to lie within 6 mm. In sub-01 that was a left
+  PCA branch feeding the right medial occipital branches across the falx.
 
 The evidence weight per mm of centerline is
 
@@ -185,7 +189,7 @@ inlets. The program minimises
 
 $$
 \sum_{a\ \mathrm{used}} \bigl(\alpha - R_a\bigr)
-+ \sum_{\mathrm{bridges}} (\beta + \mathrm{excess})
++ \sum_{\mathrm{bridges}} (\beta + \mathrm{excess} + w_\mathrm{falx}\,[\mathrm{across\ the\ falx}])
 + \sum_{a\to b} \Bigl[ w_\mathrm{turn}\,\tfrac{1-\cos\theta_{ab}}{2}
 + g\bigl(\log\tfrac{r_b}{r_a} - \log r_\mathrm{tol}\bigr) \Bigr]
 + w_\mathrm{cap}\,\rho\,\bigl|\,\ell_a - c_0 r_a^3\,\bigr|_\mathrm{slack}
@@ -195,6 +199,11 @@ where the terms are:
 
 - $R_a=\int_a w(P)\,ds$ is the evidence reward (it leaves out the junction bulge,
   so spurs inside a thick vessel earn nothing).
+- A bridge is **across the falx** when its two ends lie next to the cortex of
+  opposite hemispheres (sasparc labels within 2 mm, at least 80% one side). No
+  cortical artery is fed from the other hemisphere. Only bridges are tested,
+  because the A2s run side by side in the fissure. $w_\mathrm{falx}=20$
+  mm-equivalents is a cost, not a ban.
 - $\theta_{ab}$ is the turn angle at a junction.
 - $g$ is the radius-growth cost of a child thicker than its parent.
 - The last term is a **Murray capacity** band. The centerline length $\ell_a$
@@ -359,7 +368,11 @@ The region search waits for its slowest box, so prefer fast cores. On ex3 the
 - **Arteries only.** risc-mi learned from TOF labels. Veins and sinuses are
   not targeted, but the dark-vessel contrasts pick up some of them.
 - **Where there is no evidence, there is no tree.** In sub-01 the posterior falx
-  and the cistern of Galen have no centerlines.
+  and the cistern of Galen have no centerlines. The occipital cortical PCA
+  branches are sparse too (~70 / 150 mm of candidates, against ~1550 mm frontal
+  per side): there is ~4x less evidence per ml there in the T2w, none in the
+  pre-contrast T1w, and the post-Gd sessions disagree (Dice 0.2 against 0.6-0.7
+  frontally). Thresholds and the consensus are not what lose them.
 - **A tree has no loops.** The Circle of Willis is cut somewhere: one A1 or
   PCom ends as a dead end, possibly running backwards.
 - **Radius below ~0.3 mm is not measured.** A vessel there is 1-2 voxels wide,

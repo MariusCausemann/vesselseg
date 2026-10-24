@@ -38,7 +38,17 @@ pieces (after Tuertken et al., TPAMI 2016).
    direction, through the metric 1 + max(0, -w(P)). The --bridges cheapest
    paths to other segments that are a real shortcut (along the skeleton >= 2x
    farther, or another component) become candidate segments; the segment they
-   reach is split there. Bridges may join separate skeleton components. The
+   reach is split there. Bridges may join separate skeleton components. A free
+   end of a component that holds no inlet (find_inlets on the skeleton) also
+   searches --max_gap_far mm, for the other components only, keeping its
+   --bridges_far cheapest paths: a gap in the evidence longer than --max_gap
+   otherwise leaves the piece unreachable, or reachable only through whatever
+   happens to lie within --max_gap (sub-01: 111 mm of right medial occipital
+   PCA branches, whose own-side link is 7.5-14 mm away, were hooked onto a left
+   PCA branch across the falx by a 5.7 mm bridge; a 16 mm splenial and a
+   123 mm vermian piece were dropped). The selection decides whether a piece
+   repays its bridge (through P < --p0 a bridge costs ~4 mm-equivalents per mm,
+   which a long piece repays and a short spur does not). The
    selection drops a bridge whose ends the skeleton already joins within its
    length + --bridge_detour mm: at the native T2w resolution the test above lets
    1-2 mm parallel shortcuts through (sub-01: a 2.5 mm bridge into a thick
@@ -48,7 +58,8 @@ pieces (after Tuertken et al., TPAMI 2016).
    used arc has exactly one parent arc ending at its start node (or is an inlet
    arc), so the result is a tree grown from the inlets. The mixed-integer
    program (HiGHS) minimises
-     sum over used arcs      --alpha - reward(arc)   (+ --beta + excess for a bridge)
+     sum over used arcs      --alpha - reward(arc)   (+ --beta + excess for a bridge,
+                             + --w_falx for a bridge across the falx, see below)
      sum over dead-end arcs  --w_leaf   (a used arc without a child)
      sum over parent->child  --w_turn (1 - cos(turn)) / 2
                              + growth(log(r_child / r_parent) - log --r_tol)
@@ -79,6 +90,16 @@ pieces (after Tuertken et al., TPAMI 2016).
    a true vessel end pays it once too, repaid by its length. --w_leaf 1 (default 0:
    --prune_len does this job, see below) removes 22 of 23 such spurs (-180 mm,
    2%) and keeps the ACA link; 2 cuts it.
+   A bridge across the falx is one whose two ends lie next to the cortex of
+   opposite hemispheres (sasparc Desikan-Killiany labels within 2 mm, >= 80% one
+   side; falx_bridges). No cortical artery is fed from the other hemisphere,
+   but a faint 5-6 mm link through the posterior interhemispheric fissure is
+   cheaper than a 10-15 mm one on the own side (sub-01: the right medial
+   occipital PCA branches, from a left PCA branch). The skeleton is not
+   tested (the A2s run in the fissure side by side). sub-01: 13 of 179 bridges,
+   none in the Circle of Willis (frontal and posterior fissure, splenium). It is
+   a cost, not a ban, so a real communicating link can still pay for itself,
+   and the inlet trees are joined afterwards regardless (step 4).
    Two exact reductions keep the program small. (i) An arc u->v is dropped if u
    cannot be reached from an inlet by a directed walk of kept arcs avoiding the
    arc's own segment (a used arc needs a parent chain back to an inlet, and a
@@ -822,7 +843,10 @@ def selection_program(segs, n_nodes, r_node, inlets, args, h):
     n_tr = len(trans)
     y_cost = np.array(
         [
-            args.alpha - f["reward"] + (args.beta + segs[k].excess if segs[k].bridge else 0.0)
+            args.alpha
+            - f["reward"]
+            + (args.beta + segs[k].excess if segs[k].bridge else 0.0)
+            + (args.w_falx if getattr(segs[k], "falx", False) else 0.0)
             for k, _, _, _, f in A
         ]
     )
@@ -1050,13 +1074,43 @@ def loop_returns(A, parent):
     return out
 
 
+def falx_bridges(segs, n_skel, world, sasparc, reach=2.0, share=0.8):
+    """Bridges whose two ends lie next to the cortex of opposite hemispheres.
+
+    The hemisphere of a point: the Desikan-Killiany cortex labels of the sasparc
+    (1000s left, 2000s right, extended into the SAS) within `reach` mm, if at
+    least `share` of them are of one side (else undecided, as next to the
+    cerebellum, the brainstem or the basal cisterns). Such a bridge would feed
+    one hemisphere's arteries from the other's across the falx; the skeleton
+    itself may (the A2s run in the fissure side by side), so only bridges are
+    tested, at their ends rather than along the path. Returns segment indices."""
+    lab = np.asanyarray(sasparc.dataobj)
+    idx = np.argwhere((lab >= 1000) & (lab < 3000))
+    tree = cKDTree(nib.affines.apply_affine(sasparc.affine, idx))
+    right = lab[tuple(idx.T)] >= 2000
+
+    def side(x):
+        near = tree.query_ball_point(x, reach)
+        if not near:
+            return 0
+        f = right[near].mean()
+        return 1 if f >= share else -1 if f <= 1 - share else 0
+
+    return {
+        k
+        for k in range(n_skel, len(segs))
+        if side(world(segs[k].pts[0])) * side(world(segs[k].pts[-1])) == -1
+    }
+
+
 # ---------------------------------------------------------------------------
 
 
-def find_inlets(segs, n_skel, node_pos, world, side, z_bottom, args):
+def find_inlets(segs, n_skel, node_pos, world, side, z_bottom, args, report=True):
     """Free ends of the skeleton where the VAs and ICAs enter (see the module
     docstring). `world` maps voxel coordinates to T1w world (mm), as do `side`
-    and `z_bottom`. Returns {node: name} and the source node (the lower VA)."""
+    and `z_bottom`. Returns {node: name} and the source node (the lower VA);
+    report=False: no printing (the pieces holding an inlet, before the bridges)."""
     skel = segs[:n_skel]
     G = nx.Graph()
     G.add_edges_from((sg.u, sg.v) for sg in skel)
@@ -1119,7 +1173,7 @@ def find_inlets(segs, n_skel, node_pos, world, side, z_bottom, args):
         if world(pts[i])[2] <= x[e][2]:
             continue  # free end on top: an outlet
         s_ = "ICA-R" if side(x[e]) > 0 else "ICA-L"
-        if args.verbose:
+        if args.verbose and report:
             print(f"ICA candidate {s_} {np.round(x[e], 1)} r {r:.2f}", flush=True)
         if s_ not in ica or x[e][2] < x[ica[s_][0]][2]:
             ica[s_] = (e, r)  # the lowest: the ICA enters at the skull base
@@ -1127,11 +1181,13 @@ def find_inlets(segs, n_skel, node_pos, world, side, z_bottom, args):
     for s_ in ("VA-L", "VA-R", "ICA-R", "ICA-L"):
         found = va.get(s_) or ica.get(s_)
         if found is None:
-            print(f"warning: no {s_} inlet", flush=True)
+            if report:
+                print(f"warning: no {s_} inlet", flush=True)
             continue
         names[found[0]] = s_
         xs = np.round(x[found[0]], 1).tolist()
-        print(f"inlet {s_}: {xs}, r {found[1]:.2f} mm", flush=True)
+        if report:
+            print(f"inlet {s_}: {xs}, r {found[1]:.2f} mm", flush=True)
     if not va:
         raise SystemExit(
             f"no vertebral: no free end within --va_band {args.va_band} mm of the "
@@ -1210,7 +1266,7 @@ def load_inputs(args):
     to_t1 = np.array(json.loads((D / "t2_to_t1.json").read_text())["matrix"])
     sp = np.array(img.header.get_zooms()[:3], float)
     # crop to the mask plus room for the bridge boxes
-    pad = np.ceil(args.max_gap / sp).astype(int) + 3
+    pad = np.ceil(max(args.max_gap, args.max_gap_far) / sp).astype(int) + 3
     idx = np.argwhere(mask)
     lo = np.maximum(idx.min(axis=0) - pad, 0)
     hi = np.minimum(idx.max(axis=0) + pad + 1, mask.shape)
@@ -1316,6 +1372,19 @@ def parser():
     p.add_argument("--max_gap", type=float, default=6.0, help="bridge box, mm")
     p.add_argument("--cone", type=float, default=70.0, help="deg from end direction")
     p.add_argument("--bridges", type=int, default=2, help="candidates per free end")
+    p.add_argument(
+        "--max_gap_far",
+        type=float,
+        default=15.0,
+        help="mm, bridge box of a free end on a piece without an inlet (to other pieces)",
+    )
+    p.add_argument("--bridges_far", type=int, default=4, help="candidates per such end")
+    p.add_argument(
+        "--w_falx",
+        type=float,
+        default=20.0,
+        help="mm-eq. per bridge between the cerebral hemispheres (0: no test)",
+    )
     p.add_argument("--beta", type=float, default=2.0, help="mm-eq. per bridge")
     p.add_argument(
         "--bridge_detour",
@@ -1424,11 +1493,34 @@ def main(argv=None):
             seg_at.setdefault(u, []).append(k)
             seg_at.setdefault(v, []).append(k)
 
+        # pieces without an inlet: their free ends also search --max_gap_far mm
+        # for the other pieces (a gap in the evidence longer than --max_gap,
+        # e.g. distal PCA branches whose link through thin occipital CSF is lost)
+        comp_of = {n: i for i, c in enumerate(nx.connected_components(G)) for n in c}
+        far_comp = set()
+        if args.max_gap_far > args.max_gap:
+            skel = [Segment(u, v, *geometry(u, v, path), sp) for u, v, path in raw]
+            centre, normal = midplane(nib.load(args.sasparc))
+            inl, _ = find_inlets(
+                skel,
+                len(skel),
+                node_pos,
+                lambda x: nib.affines.apply_affine(M, x),
+                lambda x: float((np.asarray(x) - centre) @ normal),
+                float(nib.affines.apply_affine(M, np.argwhere(mask))[:, 2].min()),
+                args,
+                report=False,
+            )
+            far_comp = {comp_of[e] for e in free} - {comp_of[n] for n in inl}
+
         jobs = []
-        half = np.ceil(args.max_gap / sp).astype(int) + 2
         wcost = 1 + np.maximum(0, -weight(P, args.p0))
         cos_cone = np.cos(np.radians(args.cone))
+        n_far = 0
         for e in free:
+            far = comp_of[e] in far_comp
+            gap = args.max_gap_far if far else args.max_gap
+            half = np.ceil(gap / sp).astype(int) + 2
             k_e = seg_at[e][0]
             u, v, path = raw[k_e]
             pts, _, _ = geometry(u, v, path)
@@ -1444,7 +1536,7 @@ def main(argv=None):
             d /= np.linalg.norm(d)
             x_e = node_pos[e]
             dist = nx.single_source_dijkstra_path_length(G, e, cutoff=6 * args.max_gap, weight="w")
-            cand = vox_tree.query_ball_point(x_e * sp, args.max_gap)
+            cand = vox_tree.query_ball_point(x_e * sp, gap)
             targets = {}
             for i in cand:
                 q = vox_list[i]
@@ -1455,6 +1547,8 @@ def main(argv=None):
                 eu = np.linalg.norm(off)
                 if eu < sp.max() or off @ d < cos_cone * eu:
                     continue
+                if eu > args.max_gap and comp_of[raw[k][0]] == comp_of[e]:
+                    continue  # beyond --max_gap: other pieces only
                 su, sv = raw[k][0], raw[k][1]
                 sa, L = arc_pos[tuple(q)]
                 # along the skeleton; infinite to another piece (always a bridge)
@@ -1470,12 +1564,14 @@ def main(argv=None):
             targets = {k: q[np.all((q >= lo) & (q < hi), axis=1)] for k, q in targets.items()}
             targets = {k: q for k, q in targets.items() if len(q)}
             box = wcost[lo[0] : hi[0], lo[1] : hi[1], lo[2] : hi[2]].astype(float)
+            n_far += far
             jobs.append(
                 (e, x_e, d, box, lo, targets, sp, args.hfm_step)
-                + (args.n_theta, args.xi, args.bridges)
+                + (args.n_theta, args.xi, args.bridges_far if far else args.bridges)
             )
         print(
-            f"bridge candidates: {len(jobs)} free ends with targets of {len(free)}",
+            f"bridge candidates: {len(jobs)} free ends with targets of {len(free)}"
+            f" ({n_far} of them on {len(far_comp)} pieces without an inlet)",
             flush=True,
         )
         results = []
@@ -1535,6 +1631,8 @@ def main(argv=None):
         z_bottom = float(nib.affines.apply_affine(M, np.argwhere(mask))[:, 2].min())
         stats.update(
             free_ends=len(free),
+            free_ends_far=n_far,
+            pieces_without_inlet=len(far_comp),
             bridge_candidates=len(segs) - n_skel,
             segments=len(segs),
             nodes=len(node_pos),
@@ -1550,8 +1648,15 @@ def main(argv=None):
         cache.write_bytes(pickle.dumps((segs, node_pos, node_r, node_size, n_skel, cand)))
     world = lambda x: nib.affines.apply_affine(M, x)  # voxels -> T1w world, mm
 
+    # bridges across the falx (sasparc hemispheres at their ends): --w_falx each
+    sasparc = nib.load(args.sasparc)
+    falx = falx_bridges(segs, n_skel, world, sasparc) if args.w_falx > 0 else set()
+    for k, sg in enumerate(segs):
+        sg.falx = k in falx
+    stats["bridges_falx"] = len(falx)
+
     # inlets, in T1w world (sasparc, z)
-    centre, normal = midplane(nib.load(args.sasparc))
+    centre, normal = midplane(sasparc)
     side = lambda x: float((np.asarray(x) - centre) @ normal)
     inlet_name, source = find_inlets(
         segs, n_skel, node_pos, world, side, stats["z_bottom_t1_mm"], args
@@ -1903,6 +2008,10 @@ def main(argv=None):
         inlets=len(inlets),
         arcs_used=len(used),
         bridges_used=int(sum(segs[k].bridge for k in seg_used)),
+        bridges_used_far=int(
+            sum(segs[k].bridge and segs[k].length > args.max_gap for k in seg_used)
+        ),
+        bridges_used_falx=int(sum(segs[k].falx for k in seg_used)),
         skeleton_length_mm=round(float(skel_len), 1),
         skeleton_length_used_mm=round(float(used_len), 1),
         skeleton_segments_dropped=int(n_skel - sum(k < n_skel for k in seg_used)),
