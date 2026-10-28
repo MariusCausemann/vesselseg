@@ -39,6 +39,15 @@ have loops and no inlets, and are no longer supported.
    below its terminus, PCA leaving the basilar below its tip, ...). A territory
    therefore only changes inside a subtree when more than ~--switch mm beyond
    disagree; those junctions are reported as suspected false contacts.
+6. --rejoin_copies: extract.py cut every cycle by storing its node twice (a
+   copy offset 0.03 mm), wherever the selection closed it, and a piece can end
+   up fed through a false contact while its real join is such a copy (sub-01:
+   132 mm of PCA-R behind a faint 0.26 mm cerebellar branch). Each implausible
+   junction is cut instead, against the copy that feeds its piece from a
+   territory allowed to (by the transition costs above); then these copies,
+   not only the loop returns, go through the loop re-cut (recut_loops). Only
+   copies where a branch ends count: two passes through one node may be a
+   crossing. The tree stays a tree with the same vessels and labels.
 
 Output (next to DIR/NAME):
   NAME_labeled.vtp        NAME.vtp + cell/point data `segment` (index into the
@@ -51,7 +60,8 @@ Output (next to DIR/NAME):
                           its polylines can differ from NAME.vtp's
   NAME_tubes_labeled.vtp  NAME_tubes.vtp + cell data `segment`
   NAME_labeled.json       inlets, termini, CoW pieces, per-label length,
-                          implausible junctions
+                          implausible junctions, loops re-cut (with
+                          --rejoin_copies: contacts swapped / kept)
   NAME_labeled.png        three projections coloured by label
 
 The inlet tree of each branch (cell data `inlet`, decided by the extract.py
@@ -321,7 +331,19 @@ def inlet_points(points, edges, xyz):
     return tips[cKDTree(points[tips]).query(np.asarray(xyz))[1]]
 
 
-def recut_loops(net, seg, inlet_xyz):
+def free_copy(pos, x, step=0.03):
+    """A copy of point x the way extract.py writes one (offset k step mm along
+    (1, 1, 1)), at the first k whose place no point in ``pos`` (arrays of
+    points) takes: a consumer joins coincident points, which would close the
+    cut again."""
+    pts = np.vstack(pos)
+    k = 1
+    while (np.abs(pts - (x + k * step)).max(1) < 1e-6).any():
+        k += 1
+    return x + k * step
+
+
+def recut_loops(net, seg, inlet_xyz, copies=None, contacts=(), cost=None, switch=np.inf):
     """Re-cut the loops of one territory where their blood flows meet.
 
     extract.py writes, as field data ``loop_returns``, the point pairs where
@@ -338,25 +360,60 @@ def recut_loops(net, seg, inlet_xyz):
     basilar against a thinner artery, whose re-cut moved the basilar tip).
     Labels are unchanged, every new polyline is a piece of an old one.
 
+    With ``copies`` (extract.py's field data ``node_copies``: every point pair
+    that stores one skeleton node twice, loop returns, contacts and crossings
+    alike) the copies where a branch ends (a junction the selection left
+    unused; two passes through one node may be a crossing and stay apart) are
+    candidate joins as well as the loop returns, and the
+    suspected false contacts ``contacts`` (``(parent branch, child branch)``
+    of the implausible junctions, child downstream) are cut first: the piece
+    below such a junction is fed instead through one of its copies, the one
+    whose outer side may feed it (``cost(point, label_out, label_in) <
+    switch``, the labelling's own transition cost; cheapest, then thickest).
+    Join and cut close and open the same cycle, so the tree stays a tree and
+    no vessel is added or removed; a contact without such a copy is kept.
+    The copies then go through the loop re-cut above like loop returns.
+
     Returns ``(net, seg, report)``, ``net`` a new PolyData (polylines between
     junctions, tips and the old polyline ends, pointing down the pressure; cell
     data copied from the old polyline, ``branch``/``length``/``mean_radius``
     recomputed) and ``seg`` its labels; ``net`` is the input when nothing
-    changes. ``report`` lists the loops re-cut and skipped."""
+    changes. ``report`` lists the loops re-cut and skipped, and the contacts
+    swapped for a copy and kept."""
     pairs = np.asarray(net.field_data.get("loop_returns", np.zeros((0, 2))), np.int64)
     report = dict(recut=[], skipped=0)
-    if not len(pairs):
+    if copies is not None:
+        report.update(swapped=[], kept=[])
+    if not len(pairs) and copies is None:
         return net, seg, report
     P = np.asarray(net.points, dtype=np.float64)
     R = np.asarray(net.point_data["radius"], dtype=np.float64)
     polys = polylines(net)
     E, cell = point_edges(polys)
+    if copies is not None:
+        # a copy where a branch ends is a junction the selection left unused;
+        # two passes through one node (a crossing) are not
+        copies = np.asarray(copies, np.int64).reshape(-1, 2)
+        deg = np.bincount(E.ravel(), minlength=len(P))
+        tip = (deg[copies] == 1).any(1)
+        known = {tuple(sorted(q)) for q in pairs.tolist()}
+        extra = [q for q in copies[tip].tolist() if tuple(sorted(q)) not in known]
+        pairs = np.vstack([pairs.reshape(-1, 2), np.asarray(extra, np.int64).reshape(-1, 2)])
+        report["copies"] = dict(loop_returns=len(known), branch_ends=len(extra),
+                                crossings=int((~tip).sum()))  # fmt: skip
+    if not len(pairs):
+        return net, seg, report
     ends = {int(i) for ids in polys for i in (ids[0], ids[-1])}
     inlets = inlet_points(P, E, inlet_xyz)
     territory = set(TERRITORY) - {UNK}
     src = list(range(len(P)))  # point -> the point whose data it copies
     pos = [P]
     changed = False
+    if contacts:
+        pairs, changed = swap_contacts(
+            P, R, E, cell, polys, seg, pairs, contacts, cost, switch, inlets, src, pos, ends,
+            report,
+        )  # fmt: skip
     for pr, pu in pairs.tolist():
         G = nx.Graph()
         G.add_edges_from((int(a), int(b), {"e": k}) for k, (a, b) in enumerate(E))
@@ -379,7 +436,7 @@ def recut_loops(net, seg, inlet_xyz):
         k = min((e_in, e_out), key=flow)
         new = len(src)
         src.append(src[m])
-        pos.append(pts[m] + 0.03)
+        pos.append(free_copy(pos, pts[m]))
         E[k][E[k] == m] = new
         ends |= {m, new}
         changed = True
@@ -438,6 +495,94 @@ def recut_loops(net, seg, inlet_xyz):
     return out, np.asarray(seg)[old], report
 
 
+def swap_contacts(P, R, E, cell, polys, seg, pairs, contacts, cost, switch, inlets, src, pos,
+                  ends, report):  # fmt: skip
+    """Cut the suspected false contacts, each against a copy that feeds the
+    piece below it from a territory allowed to (recut_loops). Edits ``E``,
+    ``src``, ``pos``, ``ends`` and ``report`` in place; returns the copy pairs
+    left (renumbered by the joins) and whether anything changed."""
+    rep = {}
+
+    def find(i):
+        while i in rep:
+            i = rep[i]
+        return i
+
+    def graph():
+        G = nx.Graph()
+        G.add_edges_from((int(a), int(b), {"e": k}) for k, (a, b) in enumerate(E))
+        return G
+
+    def at(i):  # labels of the edges at point i
+        return {int(seg[cell[k]]) for k in np.flatnonzero((E == i).any(1))}
+
+    def contact_edge(pc, cc):
+        j = next(
+            int(i) for i in (polys[cc][0], polys[cc][-1]) if i in (polys[pc][0], polys[pc][-1])
+        )
+        j = find(j)
+        k = next(k for k in np.flatnonzero(cell == cc) if j in E[k])
+        return j, int(k)
+
+    def piece(G, j, k):
+        a, b = E[k]
+        H = G.copy()
+        H.remove_edge(int(a), int(b))
+        return nx.node_connected_component(H, int(b if a == j else a))
+
+    G = graph()
+    size = {c: len(piece(G, *contact_edge(*c))) for c in contacts}
+    used, changed = set(), False
+    for pc, cc in sorted(contacts, key=size.get):
+        G = graph()
+        j, k = contact_edge(pc, cc)
+        below = piece(G, j, k)
+        entry = dict(
+            labels=[NAMES[seg[pc]], NAMES[seg[cc]]], contact_xyz=P[src[j]].round(1).tolist()
+        )
+        if inlets[0] in below:  # the child side holds the source: not downstream
+            report["kept"].append(dict(entry, reason="child side holds the source"))
+            continue
+        best = None
+        for n, (a, b) in enumerate(pairs.tolist()):
+            a, b = find(a), find(b)
+            if n in used or a == b or (a in below) == (b in below):
+                continue
+            i, o = (a, b) if a in below else (b, a)
+            c = min(cost(o, lo, li) for lo in at(o) for li in at(i))
+            key = (c, -min(R[src[i]], R[src[o]]))
+            if c < switch and (best is None or key < best[0]):
+                best = (key, n, i, o)
+        if best is None:
+            report["kept"].append(dict(entry, reason="no copy into an allowed territory"))
+            continue
+        (c, _), n, i, o = best
+        inner = [q for q in range(len(E)) if E[q, 0] in below and E[q, 1] in below]
+        report["swapped"].append(
+            dict(
+                entry,
+                joined_xyz=P[src[o]].round(1).tolist(),
+                joined_labels=[NAMES[x] for x in sorted(at(i))] + ["<-"]
+                + [NAMES[x] for x in sorted(at(o))],
+                cost=float(c),
+                piece_mm=round(float(sum(np.linalg.norm(P[src[E[q, 0]]] - P[src[E[q, 1]]])
+                                         for q in inner)), 1),
+            )
+        )  # fmt: skip
+        new = len(src)  # the child end at the contact: its own copy of the point
+        src.append(src[j])
+        pos.append(free_copy(pos, P[src[j]]))
+        E[k][E[k] == j] = new
+        E[E == i] = o
+        rep[i] = o
+        ends |= {j, new, o}
+        used.add(n)
+        changed = True
+    left = [(find(a), find(b)) for n, (a, b) in enumerate(pairs.tolist()) if n not in used]
+    left = np.array([p for p in left if p[0] != p[1]], np.int64).reshape(-1, 2)
+    return left, changed
+
+
 def blood_pressure(net, inlet_xyz):
     """Poiseuille blood pressure per point of the tree (:mod:`vesselseg.tree.blood`,
     fitted radius): 1 at the tips nearest the inlets, 0 at every other tip."""
@@ -459,6 +604,12 @@ def main(argv=None):
     p.add_argument("--trunk_cost", type=float, default=2.0, help="mm-equivalents")
     p.add_argument("--unknown_cost", type=float, default=4.0, help="mm-equivalents")
     p.add_argument("--switch", type=float, default=15.0, help="mm-equivalents")
+    p.add_argument(
+        "--rejoin_copies",
+        action="store_true",
+        help="re-cut at the node copies (extract.py node_copies), not only the loop "
+        "returns, and cut the implausible junctions against a copy (recut_loops)",
+    )
     args = p.parse_args(argv)
     outdir, stem = Path(args.tree).parent, Path(args.tree).name
 
@@ -583,10 +734,11 @@ def main(argv=None):
     TR[TERRITORY[1:], UNK] = args.unknown_cost
     np.fill_diagonal(TR, 0.0)
     # ACA/MCA only leave the ICA at its terminus, PCA only the basilar at its tip
-    TRv = {}
+    TRv, TRt = {}, {}
     for t, late in [(ICA_L, [ACA, MCA_L]), (ICA_R, [ACA, MCA_R]), (VB, [PCA_L, PCA_R])]:
         Tt = TR.copy()
         Tt[t, late] = Tt[late, t] = args.switch
+        TRt[t] = Tt
         for v in interior.get(t, ()):
             TRv[v] = Tt
     lab, into, kids, _ = label_tree(tree, U, TR, source, TRv)
@@ -610,7 +762,28 @@ def main(argv=None):
 
     # loops inside one territory, re-cut by blood pressure
     inlet_xyz = tree.X[inlets]
-    out, seg_out, loops = recut_loops(net, seg, inlet_xyz)
+    if args.rejoin_copies:
+        if "node_copies" not in net.field_data:
+            raise SystemExit(f"error: {stem}.vtp has no node_copies (extract.py too old)")
+        node_at = {}  # branch end point -> graph node
+        for c, ids in enumerate(tree.polys):
+            node_at[int(ids[0])], node_at[int(ids[-1])] = tree.ends[c]
+
+        def cost(i, k_out, k_in):
+            # a point inside a branch of a trunk is inside the trunk
+            T = TRv.get(node_at[i], TR) if i in node_at else TRt.get(k_out, TR)
+            return T[k_out, k_in]
+
+        out, seg_out, loops = recut_loops(
+            net, seg, inlet_xyz, copies=net.field_data["node_copies"],
+            contacts=[tuple(s["branches"]) for s in switches], cost=cost, switch=args.switch,
+        )  # fmt: skip
+        print(
+            f"contacts: {len(loops['swapped'])} cut against a copy, {len(loops['kept'])} kept",
+            flush=True,
+        )
+    else:
+        out, seg_out, loops = recut_loops(net, seg, inlet_xyz)
     print(
         f"loops: {len(loops['recut'])} re-cut inside a territory, "
         f"{loops['skipped']} left (trunk/CoW or several labels)",

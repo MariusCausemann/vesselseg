@@ -165,7 +165,11 @@ Output (the directory of --out DIR/NAME):
   NAME.vtp        point data radius, node_type; cell data branch, length,
                   mean_radius, origin (1 = contains a bridge, 2 = joins two
                   inlet trees), inlet (index into field data inlet_names:
-                  the inlet whose tree the branch belongs to, -1 for joins)
+                  the inlet whose tree the branch belongs to, -1 for joins);
+                  field data loop_returns (see Loops) and node_copies, the
+                  point pairs (copy, first copy) of every skeleton node the
+                  output stores more than once (loops, contacts, crossings,
+                  meeting inlet trees), for label.py --rejoin_copies
   NAME_tubes.vtp  tube around each branch
   NAME.json       inputs, candidate / selection counts, objective, bridges
                   used, shared nodes (contacts and crossings), length per
@@ -1975,6 +1979,15 @@ def main(argv=None):
         (new_id[resolve(arc_pt[b][1])], new_id[resolve(arc_pt[a][0])])
         for b, a in loop_returns(A, parent)
     ]
+    copies = {}  # node -> its points (ends and passes, every tree), final ids
+    for a, (p0, p1) in arc_pt.items():
+        copies.setdefault(A[a][2], set()).add(int(new_id[resolve(p0)]))
+        copies.setdefault(A[a][3], set()).add(int(new_id[resolve(p1)]))
+    for n, pid_tree in inst.items():
+        copies.setdefault(n, set()).update(int(new_id[resolve(pid)]) for pid, _ in pid_tree)
+    node_copies = [  # (copy, first copy of the same node)
+        (c, ids[0]) for ids in (sorted(s - {-1}) for s in copies.values()) for c in ids[1:]
+    ]
     net = pv.PolyData(pts_out, lines=np.concatenate([np.r_[len(i), i] for i in lines]))
     net["radius"] = np.array(rad_out)
     net["evidence"] = np.asarray(p_out, np.float32)
@@ -1986,6 +1999,7 @@ def main(argv=None):
     net.cell_data["inlet"] = np.array(cell_tree)
     net.field_data["inlet_names"] = np.array(trees)
     net.field_data["loop_returns"] = np.array(returns, np.int64).reshape(-1, 2)
+    net.field_data["node_copies"] = np.array(node_copies, np.int64).reshape(-1, 2)
     net.save(outdir / f"{name}.vtp")
     tubes = []
     for b, ids in enumerate(lines):
