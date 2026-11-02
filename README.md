@@ -117,6 +117,29 @@ live in the workflow's config.
 
 ## Method
 
+### Overview
+
+1. **Segment.** A pretrained nnU-Net (risc-mi MS) gives an artery probability
+   map for each structural series.
+2. **Register and combine.** Every series is registered rigidly onto the T1w.
+   The maps are combined on the native T2w grid, the sharpest one. The T2w map
+   wins where it sees a vessel, and the consensus of the other series fills in
+   where it doesn't (e.g. the ICAs, lost in the T2w flow void).
+3. **Candidates.** A permissive threshold and skeleton give candidate segments
+   with a radius each. Short curvature-penalised minimal paths are added as
+   bridges across gaps in the evidence.
+4. **Select.** One mixed-integer program picks the subset of candidates that
+   forms a forest grown from the inlets (vertebrals, ICAs). It trades evidence
+   against turning angles, radius growth and Murray's law.
+5. **Fit radius.** The noisy radius is re-estimated over the whole tree,
+   smooth along branches and consistent with Murray's law at junctions.
+6. **Label.** Branches are labelled by arterial territory from the subject's
+   own parcellation, without an atlas, by an exact tree labelling. Loops are
+   re-cut where the blood flows meet, and the Poiseuille blood pressure orients
+   every branch.
+7. **Grow** (optional). Synthetic distal branches fill the subarachnoid space
+   down to the cortex, with radii from Murray's law.
+
 ### 1. Vessel probability: risc-mi MS
 
 The MS model of [risc-mi](https://github.com/risc-mi/cerebral-artery-segmentation)
