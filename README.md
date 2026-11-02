@@ -12,13 +12,16 @@ T1w, T2w, [T1w post-Gd ...]
    │  evidence    all maps on the native T2w grid; P = max(T2w, consensus of the rest)
    │  extract     candidate pieces -> one global selection (MILP) -> tree from the inlets
    │  fit-radius  radius as one regularised estimate over the tree (Murray's law)
-   ▼  label       ICA-L/R, VB, CoW, ACA, MCA-L/R, PCA-L/R, cerebellar
+   ▼  label       ICA-L/R, VB, CoW, ACA, MCA-L/R, PCA-L/R, cerebellar; blood pressure
 centerlines_labeled.vtp + centerlines_labeled.json
+   │  grow        (optional) synthetic distal branches through the SAS
+   ▼
+centerlines_labeled_grown.vtp
 ```
 
-It was developed on sub-01 of the proteoflow dataset (0.33 mm T2w, 0.5 mm T1w, three
-post-intrathecal-Gd T1w sessions). proteoflow uses the tree for its perivascular
-(PVS) mesh sleeves and the arterial circulation fields.
+It was developed on one subject (sub-01: 0.33 mm T2w, 0.5 mm T1w, three
+post-intrathecal-Gd T1w sessions), for building perivascular (PVS) meshes and
+arterial blood-flow fields on the subject's own anatomy.
 
 - [Install](#install)
 - [Usage](#usage)
@@ -41,19 +44,20 @@ vesselseg is a pure Python package (`src/vesselseg`) with one console script,
 |---|---|---|
 | risc-mi MS | nnU-Net model + weights, PyTorch | brainseg's `brainseg_riscmi.sif` (Apptainer) |
 
-**Inside proteoflow** (the normal case): proteoflow's `pyproject.toml` lists
-vesselseg, brainseg and brainmesh as path dependencies of its pixi env. They
-must be checked out next to it:
+With [pixi](https://pixi.sh), `pixi install` in this repo gives the full env
+(the `[tool.pixi]` tables of `pyproject.toml`). It expects
+brainseg, which provides the
+container lookup, checked out next to this repo (`../brainseg`). In any other
+Python >= 3.11 env:
 
 ```bash
-cd proteoflow && pixi install
-pixi run vesselseg doctor         # what is present, what is missing
+pip install -e ../brainseg -e .
+vesselseg doctor                  # what is present, what is missing
 ```
 
-**Standalone**: `pixi install` in this repo gives the same env (the
-`[tool.pixi]` tables of `pyproject.toml`; brainseg from `../brainseg`). Or use
-`pip install -e . -e ../brainseg` in any Python >= 3.11 env. HamiltonFastMarching
-comes from the `HFMpy` wheel (manylinux, no compiler needed).
+HamiltonFastMarching comes from the `HFMpy` wheel (manylinux, no compiler
+needed). To use vesselseg from another project, add it (and brainseg) as a
+dependency of that project's env, e.g. as a pixi path or git dependency.
 
 **The risc-mi container** comes from brainseg (`dockerfiles/Dockerfile.riscmi`).
 It is private because the weights are proprietary (see below), so log in first:
@@ -89,35 +93,27 @@ vesselseg evidence --t2_prob work/riscmi/t2_prob.nii.gz \
 vesselseg extract --evidence work/evidence --sasparc sasparc.nii.gz -o work/tree/centerlines --workers 64
 vesselseg fit-radius work/tree/centerlines
 vesselseg label work/tree/centerlines --sasparc sasparc.nii.gz
+
+# 7. optional: synthetic distal branches down to the cortex
+vesselseg grow work/tree/centerlines_labeled --sasparc sasparc.nii.gz --seg seg.nii.gz \
+    --evidence work/riscmi/*_prob.nii.gz
 ```
 
 Series keys: `t1` is the fixed T1w and `t2` the grid of the tree. Any other key
 is a further series. Keys that differ only in a trailing number after `gd`
 (`t1gd`, `t1gd3`, `t1gd4`) count as one contrast in the consensus.
 
-**All steps from one YAML file** (skips steps whose outputs exist):
+**Steps 1-6 from one YAML file** (skips steps whose outputs exist):
 
 ```bash
 vesselseg run --config vessels.yml     # format: vesselseg run --help
 ```
 
-**In proteoflow's Snakemake workflow** the rules `vesselSegment` → `vesselRegister`
-→ `vesselEvidence` → `vesselTree` → `vesselRadius` → `vesselLabel` build
-`results/{pat}/vessels/tree/centerlines_labeled.vtp`. The series are ses-01
-T1w/T2w plus the host's `vessel_series`, and the step options are the `vessels`
-block of `workflow.yml`. A mesh variant uses the tree by naming it:
-
-```yaml
-mesh_variants:
-  sub-01-moved-t2-falx-pvs-auto:
-    base: sub-01
-    meshconfig: configfiles/meshconfig/moved_t2_falx_pvs_vref.toml
-    vessel_centerlines: results/sub-01/vessels/tree/centerlines_labeled.vtp
-```
-
-```bash
-pixi run snakemake --profile ex3 results/sub-01/vessels/tree/centerlines_labeled.vtp
-```
+**In a workflow manager** (Snakemake, Nextflow, ...), call the steps one by one,
+one job per step and per series for `segment`. Each step reads only the files
+written by the steps before it. `vesselseg.pipeline.to_argv` turns an option
+dict into flags (`{workers: 8}` → `--workers 8`), so the per-step options can
+live in the workflow's config.
 
 ## Method
 
@@ -279,6 +275,45 @@ There is no atlas. The only anatomical input is the subject's own parcellation
      implausible switches (MCA → ACA, a PCA below the basilar tip, ...) heavily.
      The junctions that pay a switch are reported as suspected false contacts.
 
+**Loops and blood pressure.** The selection can come back to a node its own
+path already left (a real loop, or a false contact). Extraction keeps the
+output a tree by storing that node twice, as a copy offset by 0.03 mm, and
+records these pairs (`loop_returns`, and every duplicated node in
+`node_copies`). The labelling then solves a steady Poiseuille flow on the
+network, with conductance $G_e = 1/\int_e r^{-4}\,ds$, pressure 1 at the inlets
+and 0 at every other tip. A loop inside one territory is re-cut where its two
+flows meet (the local pressure minimum), not wherever the selection happened to
+close it. The final pressure is written as `blood_pressure`, which orients
+every branch for downstream flow models.
+
+With `--rejoin_copies` (opt-in), each implausible junction is also cut, against
+the node copy that feeds its piece from a territory the transition costs allow.
+Then these copies go through the same re-cut. Only copies where a branch ends
+count, because two passes through one node may be a crossing. The result has
+the same vessels and labels and is still a tree. In sub-01 this moves 131 mm of
+PCA-R from behind a faint cerebellar branch back onto the PCA-R.
+
+### 7. Synthetic distal branches (optional)
+
+The extracted tree stops near the image resolution (tip radius ~0.4 mm), so
+much of the cortical SAS lies 10-25 mm from any vessel. `vesselseg grow` adds
+the missing distal branches as a synthetic forest, in the spirit of constrained
+constructive optimisation (CCO), but as least-cost paths on the voxel graph of
+the SAS:
+
+- **Paths.** They hug the pia and follow faint evidence where there is some.
+  Edges across the falx and the tentorium are cut.
+- **Terminals.** One terminal is placed per `--spacing` mm along the pia. They
+  are shared among the tips of the extracted tree in proportion to $r^3$
+  (Murray's law), as a weighted geodesic Voronoi partition.
+- **Smoothing and radius.** The forest is smoothed by Laplacian steps that stay
+  in the SAS. Radii follow Murray's law from each tip's own radius down to
+  `--r_tip`.
+
+Synthetic chains inherit `segment` and `inlet` from their host and are marked
+`synthetic = 1`. The blood pressure is solved again over the whole network.
+They are a plausible filling, not a measurement.
+
 ## Outputs
 
 Everything is in **T1w world coordinates** (RAS mm, the scanner frame of the T1w).
@@ -291,27 +326,36 @@ Everything is in **T1w world coordinates** (RAS mm, the scanner frame of the T1w
 | `radius_raw` | point | radius as extracted |
 | `evidence` | point | $P$ at the point |
 | `node_type` | point | 2 at the source (lower vertebral) |
+| `blood_pressure` | point | Poiseuille pressure, 1 at the inlets, 0 at the other tips |
 | `segment` | point + cell | label index into `segment_names` |
 | `branch`, `length`, `mean_radius` | cell | branch id, mm, mm |
 | `origin` | cell | 1 = contains a bridge, 2 = joins two inlet trees |
 | `inlet` | cell | inlet tree (index into `inlet_names`), −1 for joins |
 | `segment_names` | field | `unknown, ICA-L, ICA-R, VB, CoW, ACA, MCA-L, MCA-R, PCA-L, PCA-R, cerebellar` |
+| `inlet_names` | field | names of the inlet trees |
+| `loop_returns`, `node_copies` | field | point pairs (copy, original) of the nodes stored twice |
+
+A node stored twice sits 0.03 mm from its original. A consumer that merges
+coincident points (to within ~1e-6 mm) therefore keeps the tree a tree.
 
 `NAME_labeled.json` contains:
-- `inlets`: `VA` is a list of points and `ICA-L` / `ICA-R` are single points.
-  proteoflow reads these as the blood inlets.
+- `inlets`: `VA` is a list of points and `ICA-L` / `ICA-R` are single points,
+  the blood inlets of a flow model.
 - `landmarks`: the ICA termini, VA confluence and basilar tip.
-- `cow_pieces`, the per-label `segments` lengths, and `implausible_junctions`.
+- `cow_pieces`, the per-label `segments` lengths, `implausible_junctions`, and
+  `loops` (loops re-cut, plus contacts swapped or kept with `--rejoin_copies`).
 
-Alongside these, the extraction step writes the following files:
+Each step also writes the following files:
 
-| file | contents |
-|---|---|
-| `NAME.json` | inputs, timings, the objective and region-search stats, `inlets_xyz`, `spacing_mm` |
-| `NAME_radius_fit.json` | fit statistics |
-| `NAME*_tubes*.vtp` | tube surfaces for viewing |
-| `NAME_labeled.png` | three projections coloured by label |
-| `NAME_candidates.pkl`, `NAME_selection.pkl` | caches for `--reuse` / `--reuse_selection` |
+| step | file | contents |
+|---|---|---|
+| extract | `NAME.vtp`, `NAME_tubes.vtp` | the unlabelled tree and its tube surface |
+| extract | `NAME.json` | inputs, timings, the objective and region-search stats, `inlets_xyz`, `spacing_mm` |
+| extract | `NAME_candidates.pkl`, `NAME_selection.pkl` | caches for `--reuse` / `--reuse_selection` |
+| fit-radius | `NAME_radius_fit.json` | fit statistics (rewrites `NAME.vtp` in place) |
+| label | `NAME_tubes_labeled.vtp` | tubes with `segment` |
+| label | `NAME_labeled.png` | three projections coloured by label |
+| grow | `NAME_labeled_grown.vtp`, `_tubes.vtp`, `.json`, `.png` | the tree plus synthetic chains (`synthetic`, `territory`), stats per label and per tip |
 
 ## Running offline (air-gapped)
 
@@ -325,17 +369,16 @@ over from a connected machine:
    It holds PyTorch, nnU-Net and the 5 fold checkpoints (stripped to inference
    keys). Copy it to `$BRAINSEG_CONTAINER_DIR` (or `~/.brainseg_containers/`) on
    the target. An Apptainer runtime is part of the pixi env.
-2. **The Python env**: pack the conda and PyPI-wheel part of the proteoflow env
-   with [pixi-pack](https://github.com/Quantco/pixi-pack). It does not pack
-   source, path or git dependencies, so install those afterwards from copies of
-   the repos. These are proteoflow, vesselseg, brainseg, brainmesh and the
-   fenicsx_ii checkout pinned in proteoflow's `pyproject.toml`.
+2. **The Python env**: pack the conda and PyPI-wheel part of the env (this
+   repo's, or that of a project that depends on vesselseg) with
+   [pixi-pack](https://github.com/Quantco/pixi-pack). It does not pack source,
+   path or git dependencies, so install those afterwards from copies of the
+   repos (vesselseg, brainseg, and any of the host project's own).
    ```bash
-   cd proteoflow
    pixi exec pixi-pack --ignore-pypi-non-wheel -o environment.tar .
    # target, next to the copied repos:
    pixi exec pixi-unpack environment.tar && source activate.sh
-   for r in proteoflow vesselseg brainseg brainmesh fenicsx_ii; do
+   for r in vesselseg brainseg; do
        pip install --no-deps --no-build-isolation -e "$r"
    done
    ```
@@ -360,8 +403,8 @@ On sub-01 (native T2w grid 0.35 × 0.33 × 0.33 mm):
 | fit-radius | 1 core | ~10 s |
 | label | 1 core | ~20 s |
 
-The region search waits for its slowest box, so prefer fast cores. On ex3 the
-`a40q` nodes are aarch64 and do not run the x86 env.
+The region search waits for its slowest box, so prefer fast cores. The env is
+built for linux-64 (x86) only.
 
 ## Limitations
 
@@ -374,7 +417,8 @@ The region search waits for its slowest box, so prefer fast cores. On ex3 the
   pre-contrast T1w, and the post-Gd sessions disagree (Dice 0.2 against 0.6-0.7
   frontally). Thresholds and the consensus are not what lose them.
 - **A tree has no loops.** The Circle of Willis is cut somewhere: one A1 or
-  PCom ends as a dead end, possibly running backwards.
+  PCom ends as a dead end. Loops inside one territory are cut where the blood
+  flows meet, but the cut between territories follows the selection.
 - **Radius below ~0.3 mm is not measured.** A vessel there is 1-2 voxels wide,
   and its radius comes from Murray's law rather than the data. A radius jump of
   more than 3× at a junction is usually a segmentation gap, not a topology error.
@@ -385,8 +429,9 @@ The region search waits for its slowest box, so prefer fast cores. On ex3 the
 ## Development
 
 ```
-src/vesselseg/        the package (cli, segment, register, evidence, hfm, pipeline, io)
-src/vesselseg/tree/   extract (MILP), radius_model, fit_radius, label
+src/vesselseg/        the package (cli, segment, register, evidence, pipeline, io)
+src/vesselseg/tree/   extract (MILP), radius_model, fit_radius, label, blood
+                      (Poiseuille pressure), grow
 tests/                unit tests, synthetic data only (pixi run test)
 experiments/          the exploratory scripts this grew from (vesselFM, risc-mi MC,
                       anat2vessels, VMTK, TubeTK, SeqSeg, the T1w-grid network,

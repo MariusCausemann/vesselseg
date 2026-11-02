@@ -19,6 +19,10 @@ COMMANDS = {
         "vesselseg.tree.label",
         "territory labels (ICA, VB, CoW, ACA, MCA, PCA, ...)",
     ),
+    "grow": (
+        "vesselseg.tree.grow",
+        "synthetic distal branches through the SAS",
+    ),
     "run": ("vesselseg.pipeline", "all steps from a YAML config"),
     "doctor": ("vesselseg.cli", "check that everything needed offline is present"),
 }
