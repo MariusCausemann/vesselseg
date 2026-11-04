@@ -1154,6 +1154,11 @@ def find_inlets(segs, n_skel, node_pos, world, side, z_bottom, args, report=True
 
     free = [e for e in main if len(at[e]) == 1]
     x = {e: world(node_pos[e]) for e in free}
+    # the VA band is measured from the lowest point of the inlet-sized pieces:
+    # a small stray piece below them (sub-01 T2w+T1w: 13 mm, r 0.3 mm, 8 mm
+    # under the VA ends) would otherwise lift the VA ends out of the band
+    if free:
+        z_bottom = max(z_bottom, min(v[2] for v in x.values()))
     va = {}
     for e in free:
         if x[e][2] > z_bottom + args.va_band:

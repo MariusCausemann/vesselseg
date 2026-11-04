@@ -22,12 +22,14 @@ lives in T1w coordinates (the segmentation, the mesh, proteoflow).
 Keys: `t1` is the T1w itself (no transform); every other key KEY needs
 REG/KEY_to_t1_0GenericAffine.mat, including `t2`. Keys that differ only by a
 trailing session number after `gd` (t1gd, t1gd3, t1gd4) are one contrast: they
-are averaged before the consensus over contrasts.
+are averaged before the consensus over contrasts. Without --probs the evidence
+is the T2w alone (consensus_other is zero; pair with `extract --t2_only`); only
+REG/t2_to_t1_0GenericAffine.mat is needed then.
 
 Output (OUT/, all on the same cropped T2w grid):
   MS_t2_prob.nii.gz       T2w probability, native (cropped, float32)
   MS_{key}_prob.nii.gz    other contrasts warped into the T2w grid (linear)
-  consensus_other.nii.gz  mean over contrasts of the non-T2 maps
+  consensus_other.nii.gz  mean over contrasts of the non-T2 maps (zero without --probs)
   roi.nii.gz              head ROI: brain+CSF of --seg dilated by 20 mm
   t2_to_t1.json           4x4 world->world (RAS mm), T2w scanner frame -> T1w frame
   evidence.json           grid, crop, inputs
@@ -175,14 +177,16 @@ def build_evidence(t2_prob, probs, reg, t1, seg, out):
         )
         save(maps[k], aff, out / f"MS_{k}_prob.nii.gz", np.float32)
         inputs[k] = str(src)
-    if not maps:
-        raise ValueError("no non-T2 probability maps: the consensus needs at least one")
-
     groups = {}
     for k, a in maps.items():
         groups.setdefault(contrast(k), []).append(a)
     print("contrasts:", {g: len(v) for g, v in groups.items()})
-    cons = np.mean([np.mean(v, axis=0) for v in groups.values()], axis=0)
+    if groups:
+        cons = np.mean([np.mean(v, axis=0) for v in groups.values()], axis=0)
+    else:
+        # T2w alone: an empty consensus, so P = max(T2w, consensus) = T2w
+        print("no non-T2 maps: T2w-only evidence (zero consensus)", flush=True)
+        cons = np.zeros(shape, np.float32)
     save(cons, aff, out / "consensus_other.nii.gz", np.float32)
 
     # head ROI: T2 voxel -> T1 voxel, nearest neighbour
@@ -232,9 +236,9 @@ def main(argv=None):
     p.add_argument("--t2_prob", required=True, type=Path, help="T2w probability map")
     p.add_argument(
         "--probs",
-        required=True,
-        nargs="+",
-        help="KEY=PATH of the other maps (t1, t1gd, ...)",
+        nargs="*",
+        default=[],
+        help="KEY=PATH of the other maps (t1, t1gd, ...); none: T2w-only evidence",
     )
     p.add_argument("--reg", required=True, type=Path, help="`vesselseg register` output")
     p.add_argument("--t1", required=True, type=Path, help="T1w image (the fixed series)")
